@@ -1,0 +1,200 @@
+# ---------------------------------------------------------------
+# CI/CD Pipeline: Test → Build → Canary Deploy
+# Triggered on push/merge to main
+# ---------------------------------------------------------------
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+# Prevent overlapping deployments on rapid merges
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ===================== 1. TEST =====================
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Lint with Ruff
+        run: uv run ruff check .
+
+      - name: Run tests
+        run: uv run pytest -v --tb=short
+
+  # ===================== 2. BUILD & PUSH =====================
+  build-and-push:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_full: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===================== 3. CANARY DEPLOY =====================
+  deploy-canary:
+    name: Canary Deploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      NAMESPACE: default
+      PROMETHEUS_URL: http://prometheus-server.monitoring.svc.cluster.local
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # ---------- Determine image tag ----------
+      - name: Set image tag
+        id: tag
+        run: echo "IMAGE_TAG=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      # ---------- Phase 1: Deploy canary ----------
+      - name: Deploy canary resources
+        run: |
+          IMAGE_TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+          # Inject the image into the canary deployment manifest
+          sed -i "s|ghcr.io/OWNER/opendota-ml-pipeline:IMAGE_TAG|${FULL_IMAGE}|g" \
+            k8s/canary-deployment.yaml
+
+          # Apply stable Ingress (idempotent — ensures it exists)
+          kubectl apply -f k8s/ingress-stable.yaml -n ${{ env.NAMESPACE }}
+
+          # Apply canary resources
+          kubectl apply -f k8s/service-canary.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/canary-deployment.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/ingress-canary.yaml -n ${{ env.NAMESPACE }}
+
+          echo "Canary deployed with image: ${FULL_IMAGE}"
+
+      # ---------- Phase 2: Verify canary ----------
+      - name: Verify canary health
+        id: verify
+        continue-on-error: true
+        run: |
+          chmod +x scripts/verify-canary.sh
+          PROMETHEUS_URL="${{ env.PROMETHEUS_URL }}" \
+          NAMESPACE="${{ env.NAMESPACE }}" \
+          ERROR_THRESHOLD="0.01" \
+          CHECK_COUNT="5" \
+          CHECK_INTERVAL="60" \
+            bash scripts/verify-canary.sh
+
+      # ---------- Phase 3a: Promote (on success) ----------
+      - name: Promote canary to stable
+        if: steps.verify.outcome == 'success'
+        run: |
+          IMAGE_TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+          echo "Canary passed — promoting to stable..."
+
+          # Update the stable deployment image
+          kubectl set image deployment/opendota-ml-pipeline \
+            opendota-api="${FULL_IMAGE}" \
+            -n ${{ env.NAMESPACE }}
+
+          # Wait for stable rollout
+          kubectl rollout status deployment/opendota-ml-pipeline \
+            -n ${{ env.NAMESPACE }} --timeout=300s
+
+          # Tear down canary resources
+          kubectl delete ingress opendota-ml-pipeline-ingress-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+          kubectl delete deployment opendota-ml-pipeline-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+          kubectl delete service opendota-ml-pipeline-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+
+          echo "Promotion complete. 100% traffic on new version ${IMAGE_TAG}."
+
+      # ---------- Phase 3b: Rollback (on failure) ----------
+      - name: Rollback canary
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "Canary FAILED — rolling back..."
+
+          # Remove canary resources; stable deployment untouched
+          kubectl delete ingress opendota-ml-pipeline-ingress-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+          kubectl delete deployment opendota-ml-pipeline-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+          kubectl delete service opendota-ml-pipeline-canary \
+            -n ${{ env.NAMESPACE }} --ignore-not-found
+
+          echo "Rollback complete. Stable deployment unchanged."
+
+      - name: Fail pipeline on rollback
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "::error::Canary verification failed — deployment rolled back."
+          exit 1

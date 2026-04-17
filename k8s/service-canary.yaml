@@ -1,9 +1,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: opendota-ml-pipeline-service
+  name: opendota-ml-pipeline-canary
   labels:
     app: opendota-ml-pipeline
+    track: canary
 spec:
   type: ClusterIP
   ports:
@@ -12,4 +13,4 @@ spec:
       protocol: TCP
   selector:
     app: opendota-ml-pipeline
-    track: stable
+    track: canary

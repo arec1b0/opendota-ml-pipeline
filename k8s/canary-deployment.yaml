@@ -1,15 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: opendota-ml-pipeline
+  name: opendota-ml-pipeline-canary
   labels:
     app: opendota-ml-pipeline
-    track: stable
+    track: canary
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: opendota-ml-pipeline
+      track: canary
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -19,12 +20,12 @@ spec:
     metadata:
       labels:
         app: opendota-ml-pipeline
-        track: stable
+        track: canary
     spec:
       containers:
       - name: opendota-api
-        image: ghcr.io/OWNER/opendota-ml-pipeline:latest
-        imagePullPolicy: IfNotPresent
+        image: ghcr.io/OWNER/opendota-ml-pipeline:IMAGE_TAG
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
         envFrom:
