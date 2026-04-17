@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends
+from app.api.endpoints import predict
 from app.models.schemas import MatchData
 from app.services.opendota_client import OpenDotaClient
 from app.services.mlflow_tracker import MLflowTracker
@@ -7,6 +8,8 @@ from app.api.dependencies import get_opendota_client, get_mlflow_tracker
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+router.include_router(predict.router, tags=["predict"])
 
 @router.get("/match/{match_id}", response_model=MatchData)
 async def ingest_match(

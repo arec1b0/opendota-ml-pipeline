@@ -1,0 +1,24 @@
+stages:
+  scrape_data:
+    cmd: python scripts/scrape_data.py
+    deps:
+      - scripts/scrape_data.py
+    outs:
+      - data/raw/
+  
+  process_features:
+    cmd: python scripts/process_features.py
+    deps:
+      - scripts/process_features.py
+      - data/raw/
+    outs:
+      - data/processed/
+
+  train_model:
+    cmd: python scripts/train_model.py
+    deps:
+      - scripts/train_model.py
+      - data/processed/
+    metrics:
+      - metrics.json:
+          cache: false
